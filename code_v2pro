@@ -1,0 +1,984 @@
+"""
+================================================================================
+HỆ THỐNG XE TỰ HÀNH & ĐIỀU KHIỂN WEB TRÊN ESP32 (MICROPYTHON)
+================================================================================
+Sơ đồ chân phần cứng (Giữ nguyên):
+- L298N Bánh Trái (Motor A): ENA = GPIO 25 (PWM), IN1 = GPIO 26, IN2 = GPIO 27
+- L298N Bánh Phải (Motor B): ENB = GPIO 33 (PWM), IN3 = GPIO 14, IN4 = GPIO 13
+- Cảm biến siêu âm SRF05   : TRIG = GPIO 18, ECHO = GPIO 19 (Đã hạ áp 3.3V)
+- Động cơ Servo (Quét góc) : SIGNAL = GPIO 5 (PWM 50Hz, góc 0° - 180°)
+- Cảm biến góc MPU6050     : SDA = GPIO 21, SCL = GPIO 22 (I2C 3.3V)
+
+Tính năng nâng cấp:
+1. Web App trên điện thoại (Wi-Fi AP: ESP32_Robot_Car | IP: 192.168.4.1):
+   - Chuyển đổi AUTO / MANUAL mượt mà.
+   - Chỉnh tốc độ tùy ý (Slider + Nút chọn nhanh 100 / 150 / 200).
+   - Bản đồ Canvas vẽ quỹ đạo xe đi theo thời gian thực + cảnh báo trạng thái.
+2. Chống kẹt mù bằng MPU6050 (Stall Detection):
+   - Khi siêu âm không thấy vật cản nhưng xe bị kẹt (cản thấp dưới gầm, kẹt bánh),
+     MPU6050 phát hiện xe không có dao động di chuyển -> Tự động lùi sâu và
+     quay sang hướng mới khác với hướng ban đầu.
+================================================================================
+"""
+
+from machine import Pin, PWM, SoftI2C, time_pulse_us
+import network
+import socket
+import time
+import math
+import gc
+
+
+# ==============================================================================
+# 1. CẤU HÌNH CHÂN CẮM & THÔNG SỐ VẬN HÀNH
+# ==============================================================================
+class Config:
+    # --- Wi-Fi Access Point (Kết nối trực tiếp từ điện thoại) ---
+    WIFI_AP_SSID = "ESP32_Robot_Car"
+    WIFI_AP_PASS = "12345678"
+
+    # --- L298N Bánh Trái (Động cơ A) ---
+    ENA_PIN = 25
+    IN1_PIN = 26
+    IN2_PIN = 27
+
+    # --- L298N Bánh Phải (Động cơ B) ---
+    ENB_PIN = 33
+    IN3_PIN = 14
+    IN4_PIN = 13
+
+    # --- Siêu âm SRF05 ---
+    TRIG_PIN = 18
+    ECHO_PIN = 19
+
+    # --- Servo Quét Góc ---
+    SERVO_PIN = 5
+    SERVO_CENTER = 90
+
+    # --- MPU6050 I2C ---
+    SDA_PIN = 21
+    SCL_PIN = 22
+    MPU_ADDR = 0x68
+
+    # --- Ngưỡng khoảng cách (cm) ---
+    DIST_CRUISE = 55.0
+    DIST_STOP = 26.0
+    DIST_CLEAR_PATH = 35.0
+
+    # --- Ngưỡng vận tốc (Thang chuẩn 0 - 255) ---
+    PWM_SCALE = 255.0
+    SPEED_NORMAL = 130
+    SPEED_MIN = 95
+    SPEED_BACKUP = 115
+
+    # --- Cấu hình Quay 90 Độ Vận Tốc Nhanh ---
+    TURN_ANGLE_90 = 90.0
+    SPEED_TURN_FAST = 200
+    SPEED_TURN_MIN = 125
+    SPEED_TURN_INNER = 35
+
+    # --- Thời gian lùi sâu (ms) ---
+    BACKUP_TIME_NORMAL = 850
+    BACKUP_TIME_DEADEND = 1100
+    BACKUP_TIME_STUCK = 1050   # Lùi sâu khi MPU6050 phát hiện kẹt mù
+
+    # --- Hệ số PID ---
+    KP_HEADING = 2.6
+    KD_HEADING = 0.50
+    KP_TURN = 2.0
+
+    # --- Cấu hình phát hiện kẹt bằng MPU6050 (Stall Detection) ---
+    # Khi động cơ chạy trên mặt sàn, rung động cơ học + chuyển động tạo ra biến thiên
+    # gia tốc (dynamic_accel) và vận tốc góc. Nếu xe bị giữ đứng yên (kẹt),
+    # độ biến thiên này giảm mạnh dưới ngưỡng STALL_MOTION_THRESHOLD.
+    STALL_MOTION_THRESHOLD = 0.032  # Ngưỡng dao động động học tối thiểu khi xe đang lăn bánh
+    STALL_TIMEOUT_MS = 1200         # Sau 1.2s cấp điện mà không nhúc nhích -> Xác nhận kẹt
+
+    # --- Hệ số quy đổi tốc độ sang cm/s để vẽ quỹ đạo ---
+    CM_PER_SEC_AT_255 = 42.0
+
+
+# ==============================================================================
+# 2. GIAO DIỆN WEB ĐIỀU KHIỂN & VẼ QUỸ ĐẠO (HTML5 + CANVAS)
+# ==============================================================================
+WEB_HTML = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>ESP32 Autonomous & Teleop</title>
+<style>
+*{box-sizing:border-box;user-select:none;-webkit-user-select:none;font-family:system-ui,-apple-system,sans-serif}
+body{margin:0;padding:10px;background:#0f172a;color:#f8fafc;text-align:center}
+.card{background:#1e293b;border-radius:14px;padding:12px;margin-bottom:10px;box-shadow:0 4px 12px rgba(0,0,0,0.35)}
+h2{margin:4px 0 8px;font-size:18px;color:#38bdf8}
+.status-bar{display:flex;justify-content:space-around;font-size:13px;background:#0f172a;padding:8px;border-radius:8px;margin-bottom:8px}
+.badge{padding:3px 8px;border-radius:6px;font-weight:700}
+.bg-auto{background:#059669;color:#fff}
+.bg-man{background:#d97706;color:#fff}
+.bg-stuck{background:#dc2626;color:#fff}
+canvas{background:#090d16;border:1px solid #334155;border-radius:10px;width:100%;max-width:360px;height:240px}
+.row{display:flex;justify-content:center;gap:8px;margin:6px 0;flex-wrap:wrap}
+button{border:none;border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600;color:#fff;background:#334155;cursor:pointer;transition:0.12s}
+button:active{transform:scale(0.95)}
+.btn-mode{background:#2563eb;flex:1}
+.btn-preset{background:#475569;flex:1}
+.btn-preset.active{background:#0284c7;border:2px solid #7dd3fc}
+.dpad{display:grid;grid-template-columns:repeat(3,78px);grid-template-rows:repeat(3,58px);gap:8px;justify-content:center;margin-top:8px}
+.btn-dir{background:#1d4ed8;font-size:20px}
+.btn-stop{background:#dc2626;font-size:15px}
+input[type=range]{width:100%;accent-color:#38bdf8;margin:6px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>ĐIỀU KHIỂN & QUỸ ĐẠO XE ESP32</h2>
+  <div class="status-bar">
+    <div>Chế độ: <span id="st_mode" class="badge bg-auto">AUTO</span></div>
+    <div>Vật cản: <b id="st_dist">--</b> cm</div>
+    <div>Góc Yaw: <b id="st_yaw">0</b>°</div>
+  </div>
+  <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">
+    Trạng thái: <b id="st_state" style="color:#38bdf8">Đang khởi tạo...</b>
+  </div>
+  <canvas id="trajCanvas" width="360" height="240"></canvas>
+  <div class="row">
+    <button onclick="clearMap()" style="padding:6px 12px;font-size:12px">Xóa quỹ đạo</button>
+    <button id="btnMode" class="btn-mode" onclick="toggleMode()">Chuyển sang THỦ CÔNG</button>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-size:14px;margin-bottom:4px">
+    Bảng chỉnh tốc độ: <b id="spdVal" style="color:#38bdf8;font-size:16px">150</b> / 255
+  </div>
+  <input type="range" id="spdSlider" min="90" max="255" value="150" onchange="setSpeed(this.value)" oninput="document.getElementById('spdVal').innerText=this.value">
+  <div class="row">
+    <button id="p100" class="btn-preset" onclick="setSpeed(100)">Mức 100</button>
+    <button id="p150" class="btn-preset active" onclick="setSpeed(150)">Mức 150</button>
+    <button id="p200" class="btn-preset" onclick="setSpeed(200)">Mức 200</button>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-size:13px;color:#94a3b8">Điều khiển hướng (Nhấn giữ để chạy, thả để dừng)</div>
+  <div class="dpad">
+    <div></div>
+    <button class="btn-dir" onmousedown="sendCmd('F')" onmouseup="sendCmd('S')" ontouchstart="sendCmd('F');event.preventDefault()" ontouchend="sendCmd('S');event.preventDefault()">▲</button>
+    <div></div>
+    <button class="btn-dir" onmousedown="sendCmd('L')" onmouseup="sendCmd('S')" ontouchstart="sendCmd('L');event.preventDefault()" ontouchend="sendCmd('S');event.preventDefault()">◀</button>
+    <button class="btn-stop" onclick="sendCmd('S')">DỪNG</button>
+    <button class="btn-dir" onmousedown="sendCmd('R')" onmouseup="sendCmd('S')" ontouchstart="sendCmd('R');event.preventDefault()" ontouchend="sendCmd('S');event.preventDefault()">▶</button>
+    <div></div>
+    <button class="btn-dir" onmousedown="sendCmd('B')" onmouseup="sendCmd('S')" ontouchstart="sendCmd('B');event.preventDefault()" ontouchend="sendCmd('S');event.preventDefault()">▼</button>
+    <div></div>
+  </div>
+</div>
+
+<script>
+let currentMode = "AUTO";
+let pathPoints = [{x:0, y:0}];
+let currentYaw = 0;
+const canvas = document.getElementById('trajCanvas');
+const ctx = canvas.getContext('2d');
+
+function updatePresetUI(val){
+  val = parseInt(val);
+  document.getElementById('spdSlider').value = val;
+  document.getElementById('spdVal').innerText = val;
+  ['100','150','200'].forEach(p => {
+    document.getElementById('p'+p).className = (val === parseInt(p)) ? 'btn-preset active' : 'btn-preset';
+  });
+}
+
+function setSpeed(val){
+  updatePresetUI(val);
+  fetch('/cmd?spd=' + val).catch(()=>{});
+}
+
+function toggleMode(){
+  let next = (currentMode === "AUTO") ? "MANUAL" : "AUTO";
+  fetch('/cmd?mode=' + next).then(r=>r.json()).then(d=>applyTelemetry(d)).catch(()=>{});
+}
+
+function sendCmd(dir){
+  if(currentMode === "AUTO") currentMode = "MANUAL";
+  fetch('/cmd?mode=MANUAL&dir=' + dir).catch(()=>{});
+}
+
+function clearMap(){
+  pathPoints = [{x:0, y:0}];
+  fetch('/cmd?reset_map=1').catch(()=>{});
+  drawTrajectory();
+}
+
+function drawTrajectory(){
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+
+  // Vẽ lưới tọa độ
+  ctx.strokeStyle = '#1e293b';
+  ctx.lineWidth = 1;
+  for(let x=0; x<canvas.width; x+=30){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke(); }
+  for(let y=0; y<canvas.height; y+=30){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke(); }
+
+  if(pathPoints.length === 0) return;
+
+  // Tự động co giãn tỷ lệ (Auto-scale) để quỹ đạo luôn nằm gọn trong màn hình
+  let maxCoord = 60;
+  pathPoints.forEach(p => {
+    maxCoord = Math.max(maxCoord, Math.abs(p.x), Math.abs(p.y));
+  });
+  let scale = (Math.min(cx, cy) - 22) / maxCoord;
+
+  // Vẽ đường quỹ đạo xe đã đi
+  ctx.strokeStyle = '#38bdf8';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  pathPoints.forEach((p, idx) => {
+    let sx = cx + p.x * scale;
+    let sy = cy - p.y * scale;
+    if(idx === 0) ctx.moveTo(sx, sy);
+    else ctx.lineTo(sx, sy);
+  });
+  ctx.stroke();
+
+  // Điểm xuất phát
+  ctx.fillStyle = '#94a3b8';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 4, 0, Math.PI*2);
+  ctx.fill();
+
+  // Vẽ vị trí và hướng mũi xe hiện tại
+  let last = pathPoints[pathPoints.length - 1];
+  let rx = cx + last.x * scale;
+  let ry = cy - last.y * scale;
+  let rad = -currentYaw * Math.PI / 180.0;
+
+  ctx.save();
+  ctx.translate(rx, ry);
+  ctx.rotate(rad);
+  ctx.fillStyle = '#22c55e';
+  ctx.beginPath();
+  ctx.moveTo(0, -9);
+  ctx.lineTo(-6, 7);
+  ctx.lineTo(6, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function applyTelemetry(d){
+  currentMode = d.mode;
+  let badge = document.getElementById('st_mode');
+  badge.innerText = d.mode;
+  badge.className = 'badge ' + (d.mode === 'AUTO' ? 'bg-auto' : 'bg-man');
+  document.getElementById('btnMode').innerText = (d.mode === 'AUTO') ? 'Chuyển sang THỦ CÔNG' : 'Chuyển sang TỰ HÀNH (AUTO)';
+  document.getElementById('st_dist').innerText = d.dist.toFixed(0);
+  document.getElementById('st_yaw').innerText = d.yaw.toFixed(0);
+  document.getElementById('st_state').innerText = d.state;
+  currentYaw = d.yaw;
+
+  let last = pathPoints[pathPoints.length - 1];
+  if(Math.hypot(d.x - last.x, d.y - last.y) > 1.5){
+    pathPoints.push({x: d.x, y: d.y});
+    if(pathPoints.length > 250) pathPoints.shift();
+  }
+  drawTrajectory();
+}
+
+setInterval(() => {
+  fetch('/status').then(r=>r.json()).then(d=>applyTelemetry(d)).catch(()=>{});
+}, 280);
+
+drawTrajectory();
+</script>
+</body>
+</html>
+"""
+
+
+# ==============================================================================
+# 3. LỚP ĐIỀU KHIỂN ĐỘNG CƠ L298N
+# ==============================================================================
+class MotorDriver:
+    def __init__(self):
+        self.in1 = Pin(Config.IN1_PIN, Pin.OUT, value=0)
+        self.in2 = Pin(Config.IN2_PIN, Pin.OUT, value=0)
+        self.in3 = Pin(Config.IN3_PIN, Pin.OUT, value=0)
+        self.in4 = Pin(Config.IN4_PIN, Pin.OUT, value=0)
+
+        self.ena = PWM(Pin(Config.ENA_PIN), freq=1000)
+        self.enb = PWM(Pin(Config.ENB_PIN), freq=1000)
+
+        self.curr_left = 0.0
+        self.curr_right = 0.0
+        self.stop()
+
+    def _write_pwm(self, pwm_obj, speed_val):
+        speed_val = max(0.0, min(Config.PWM_SCALE, float(speed_val)))
+        if hasattr(pwm_obj, "duty_u16"):
+            pwm_obj.duty_u16(int(speed_val * 65535 / Config.PWM_SCALE))
+        else:
+            pwm_obj.duty(int(speed_val * 1023 / Config.PWM_SCALE))
+
+    def set_motors(self, left_speed, right_speed):
+        self.curr_left = max(-Config.PWM_SCALE, min(Config.PWM_SCALE, float(left_speed)))
+        self.curr_right = max(-Config.PWM_SCALE, min(Config.PWM_SCALE, float(right_speed)))
+
+        # Bánh Trái (Motor A)
+        if self.curr_left > 1.0:
+            self.in1.value(1)
+            self.in2.value(0)
+            self._write_pwm(self.ena, self.curr_left)
+        elif self.curr_left < -1.0:
+            self.in1.value(0)
+            self.in2.value(1)
+            self._write_pwm(self.ena, -self.curr_left)
+        else:
+            self.in1.value(0)
+            self.in2.value(0)
+            self._write_pwm(self.ena, 0)
+
+        # Bánh Phải (Motor B)
+        if self.curr_right > 1.0:
+            self.in3.value(1)
+            self.in4.value(0)
+            self._write_pwm(self.enb, self.curr_right)
+        elif self.curr_right < -1.0:
+            self.in3.value(0)
+            self.in4.value(1)
+            self._write_pwm(self.enb, -self.curr_right)
+        else:
+            self.in3.value(0)
+            self.in4.value(0)
+            self._write_pwm(self.enb, 0)
+
+    def move_smooth(self, target_left, target_right, max_step=15.0):
+        diff_l = target_left - self.curr_left
+        diff_r = target_right - self.curr_right
+
+        new_l = self.curr_left + math.copysign(max_step, diff_l) if abs(diff_l) > max_step else target_left
+        new_r = self.curr_right + math.copysign(max_step, diff_r) if abs(diff_r) > max_step else target_right
+        self.set_motors(new_l, new_r)
+
+    def brake(self):
+        self.in1.value(1)
+        self.in2.value(1)
+        self.in3.value(1)
+        self.in4.value(1)
+        self._write_pwm(self.ena, Config.PWM_SCALE)
+        self._write_pwm(self.enb, Config.PWM_SCALE)
+        time.sleep_ms(70)
+        self.stop()
+
+    def stop(self):
+        self.in1.value(0)
+        self.in2.value(0)
+        self.in3.value(0)
+        self.in4.value(0)
+        self._write_pwm(self.ena, 0)
+        self._write_pwm(self.enb, 0)
+        self.curr_left = 0.0
+        self.curr_right = 0.0
+
+
+# ==============================================================================
+# 4. LỚP CẢM BIẾN SIÊU ÂM SRF05 & SERVO QUÉT GÓC
+# ==============================================================================
+class UltrasonicSRF05:
+    def __init__(self):
+        self.trig = Pin(Config.TRIG_PIN, Pin.OUT, value=0)
+        self.echo = Pin(Config.ECHO_PIN, Pin.IN)
+
+    def _read_once(self):
+        self.trig.value(0)
+        time.sleep_us(2)
+        self.trig.value(1)
+        time.sleep_us(10)
+        self.trig.value(0)
+        try:
+            pulse_time = time_pulse_us(self.echo, 1, 22000)
+            if pulse_time < 0:
+                return 250.0
+            distance = (pulse_time * 0.0343) / 2.0
+            return min(250.0, max(2.0, distance))
+        except OSError:
+            return 250.0
+
+    def get_distance(self, samples=3):
+        if samples <= 1:
+            return self._read_once()
+        readings = []
+        for _ in range(samples):
+            readings.append(self._read_once())
+            time.sleep_ms(4)
+        readings.sort()
+        return readings[len(readings) // 2]
+
+
+class RadarServo:
+    def __init__(self):
+        self.pwm = PWM(Pin(Config.SERVO_PIN), freq=50)
+        self.current_angle = Config.SERVO_CENTER
+        self.set_angle(Config.SERVO_CENTER, settle_ms=200)
+
+    def _write_angle_pwm(self, angle):
+        angle = max(10, min(170, int(angle)))
+        pulse_us = 500 + (angle * 2000) // 180
+        if hasattr(self.pwm, "duty_ns"):
+            self.pwm.duty_ns(pulse_us * 1000)
+        elif hasattr(self.pwm, "duty_u16"):
+            self.pwm.duty_u16(int(pulse_us * 65535 // 20000))
+        else:
+            self.pwm.duty(int(pulse_us * 1023 // 20000))
+
+    def set_angle(self, target_angle, settle_ms=135):
+        self._write_angle_pwm(target_angle)
+        self.current_angle = target_angle
+        if settle_ms > 0:
+            time.sleep_ms(settle_ms)
+
+    def center(self):
+        if self.current_angle != Config.SERVO_CENTER:
+            self.set_angle(Config.SERVO_CENTER, settle_ms=135)
+
+
+# ==============================================================================
+# 5. LỚP MPU6050: ĐO GÓC YAW, PHÁT HIỆN XE BỊ KẸT & TÍNH QUỸ ĐẠO
+# ==============================================================================
+class IMU_MPU6050:
+    def __init__(self):
+        self.available = False
+        self.gyro_z_offset = 0.0
+        self.yaw = 0.0          # Góc Yaw cục bộ (phục vụ giữ thẳng & quay 90°)
+        self.global_yaw = 0.0   # Góc Yaw toàn cục (phục vụ vẽ bản đồ quỹ đạo)
+        self.gz_deg_s = 0.0
+        self.motion_energy = 0.1
+        self._prev_accel_mag = 1.0
+        self.last_us = time.ticks_us()
+
+        try:
+            self.i2c = SoftI2C(scl=Pin(Config.SCL_PIN), sda=Pin(Config.SDA_PIN), freq=400000)
+            devices = self.i2c.scan()
+            if Config.MPU_ADDR in devices:
+                self.i2c.writeto_mem(Config.MPU_ADDR, 0x6B, b'\x00')  # Wake up
+                time.sleep_ms(50)
+                self.i2c.writeto_mem(Config.MPU_ADDR, 0x1A, b'\x03')  # DLPF 44Hz
+                self.i2c.writeto_mem(Config.MPU_ADDR, 0x1B, b'\x08')  # Gyro +-500 deg/s
+                self.i2c.writeto_mem(Config.MPU_ADDR, 0x1C, b'\x00')  # Accel +-2g
+                self.available = True
+                print("[MPU6050] Đã kết nối! Đang hiệu chuẩn Gyro (giữ xe đứng yên)...")
+                self.calibrate(samples=120)
+            else:
+                print("[MPU6050] Không tìm thấy 0x68! Chạy chế độ dự phòng.")
+        except Exception as e:
+            print("[MPU6050] Lỗi khởi tạo I2C:", e)
+            self.available = False
+
+    def _to_int16(self, high, low):
+        val = (high << 8) | low
+        return val - 65536 if val > 32767 else val
+
+    def _read_all_raw(self):
+        """Đọc liền 14 byte từ 0x3B (Accel X,Y,Z + Temp + Gyro X,Y,Z)."""
+        data = self.i2c.readfrom_mem(Config.MPU_ADDR, 0x3B, 14)
+        ax = self._to_int16(data[0], data[1]) / 16384.0
+        ay = self._to_int16(data[2], data[3]) / 16384.0
+        az = self._to_int16(data[4], data[5]) / 16384.0
+        gz = self._to_int16(data[12], data[13])
+        return ax, ay, az, gz
+
+    def calibrate(self, samples=120):
+        if not self.available:
+            return
+        total_gz = 0.0
+        valid = 0
+        for _ in range(samples):
+            try:
+                _, _, _, gz = self._read_all_raw()
+                total_gz += gz
+                valid += 1
+            except Exception:
+                pass
+            time.sleep_ms(4)
+        if valid > 0:
+            self.gyro_z_offset = total_gz / valid
+        self.yaw = 0.0
+        self.global_yaw = 0.0
+        self.last_us = time.ticks_us()
+        print("[MPU6050] Hiệu chuẩn xong! Offset Z =", round(self.gyro_z_offset, 2))
+
+    def reset_yaw(self):
+        """Chỉ reset góc cục bộ, giữ nguyên global_yaw để vẽ tiếp bản đồ."""
+        self.yaw = 0.0
+        self.last_us = time.ticks_us()
+
+    def update(self):
+        if not self.available:
+            return 0.0
+        now_us = time.ticks_us()
+        dt = time.ticks_diff(now_us, self.last_us) / 1_000_000.0
+        self.last_us = now_us
+
+        if dt <= 0 or dt > 0.5:
+            return self.yaw
+
+        try:
+            ax, ay, az, raw_gz = self._read_all_raw()
+
+            # 1. Tính vận tốc góc và tích phân góc Yaw
+            rate = (raw_gz - self.gyro_z_offset) / 65.5
+            if abs(rate) < 0.6:
+                rate = 0.0
+            self.gz_deg_s = rate
+            delta_yaw = rate * dt
+            self.yaw += delta_yaw
+            self.global_yaw += delta_yaw
+
+            # 2. Tính năng lượng dao động động học (Motion Energy) để phát hiện xe bị kẹt:
+            # Kết hợp biến thiên gia tốc 3 trục (rung động lăn bánh) và tốc độ xoay Gyro
+            accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+            accel_jerk = abs(accel_mag - self._prev_accel_mag)
+            self._prev_accel_mag = accel_mag
+
+            inst_motion = accel_jerk + (abs(rate) * 0.015)
+            # Bộ lọc thông thấp EMA giúp mượt giá trị năng lượng chuyển động
+            self.motion_energy = 0.82 * self.motion_energy + 0.18 * inst_motion
+        except Exception:
+            pass
+
+        return self.yaw
+
+
+# ==============================================================================
+# 6. HỆ THỐNG XE TỰ HÀNH KẾT HỢP ĐIỀU KHIỂN WEB & CHỐNG KẸT MPU6050
+# ==============================================================================
+class AutonomousCar:
+    def __init__(self):
+        print("Khởi động Hệ Thống Xe Tự Hành & Web Teleop ESP32...")
+        self.motors = MotorDriver()
+        self.sonar = UltrasonicSRF05()
+        self.servo = RadarServo()
+        self.imu = IMU_MPU6050()
+
+        # Trạng thái điều khiển & Giao diện
+        self.mode = "AUTO"                     # "AUTO" hoặc "MANUAL"
+        self.manual_cmd = "S"                  # 'F', 'B', 'L', 'R', 'S'
+        self.user_speed = Config.SPEED_NORMAL  # Chỉnh tùy ý từ Web (100 / 150 / 200...)
+        self.state_text = "Đang chạy tự hành"
+        self.last_dist = 150.0
+
+        # Biến phục vụ Odometry (Vẽ quỹ đạo X, Y tính bằng cm)
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.last_odom_ms = time.ticks_ms()
+
+        # Biến phục vụ phát hiện kẹt bằng MPU6050
+        self.target_yaw = 0.0
+        self.stall_start_ms = None
+        self.last_escape_dir = 1  # Lưu hướng thoát gần nhất để đổi hướng mới khi kẹt lặp lại
+
+        # Khởi tạo Wi-Fi AP & Web Socket không chặn (Non-blocking)
+        self.server_sock = None
+        self._init_wifi_and_server()
+
+    def _init_wifi_and_server(self):
+        try:
+            ap = network.WLAN(network.AP_IF)
+            ap.active(True)
+            ap.config(essid=Config.WIFI_AP_SSID, password=Config.WIFI_AP_PASS, authmode=network.AUTH_WPA_WPA2_PSK)
+            ip_addr = ap.ifconfig()[0]
+            print(f"[WIFI AP] Đã phát Wi-Fi: '{Config.WIFI_AP_SSID}' | Mật khẩu: '{Config.WIFI_AP_PASS}'")
+            print(f"[WEB UI] Mở trình duyệt điện thoại truy cập: http://{ip_addr}")
+
+            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind(('0.0.0.0', 80))
+            self.server_sock.listen(3)
+            self.server_sock.setblocking(False)
+        except Exception as e:
+            print("[WEB UI] Lỗi khởi tạo Web Server:", e)
+
+    def update_odometry(self):
+        """Tính toán tọa độ (X, Y) của xe dựa trên góc hướng MPU6050 và tốc độ 2 bánh."""
+        now_ms = time.ticks_ms()
+        dt = time.ticks_diff(now_ms, self.last_odom_ms) / 1000.0
+        self.last_odom_ms = now_ms
+
+        if dt <= 0 or dt > 0.5:
+            return
+
+        avg_pwm = (self.motors.curr_left + self.motors.curr_right) / 2.0
+        if abs(avg_pwm) < 40.0:
+            return
+
+        # Quy đổi PWM sang vận tốc dài gần đúng (cm/s)
+        linear_vel = (avg_pwm / Config.PWM_SCALE) * Config.CM_PER_SEC_AT_255
+        rad = math.radians(self.imu.global_yaw)
+        # Trục Y hướng về phía trước lúc khởi động, trục X hướng sang phải
+        self.pos_x += -linear_vel * math.sin(rad) * dt
+        self.pos_y += linear_vel * math.cos(rad) * dt
+
+    def _get_telemetry_json(self):
+        return (
+            '{"mode":"%s","dist":%.1f,"yaw":%.1f,"x":%.1f,"y":%.1f,"spd":%d,"state":"%s"}'
+            % (
+                self.mode,
+                self.last_dist,
+                self.imu.global_yaw,
+                self.pos_x,
+                self.pos_y,
+                int(self.user_speed),
+                self.state_text,
+            )
+        )
+
+    def poll_web_client(self):
+        """Xử lý yêu cầu từ điện thoại siêu nhanh (không làm trễ vòng lặp xe)."""
+        if not self.server_sock:
+            return
+        try:
+            conn, _ = self.server_sock.accept()
+            conn.settimeout(0.04)
+            req = conn.recv(512).decode('utf-8', 'ignore')
+            first_line = req.split('\r\n')[0]
+            parts = first_line.split(' ')
+            path = parts[1] if len(parts) > 1 else "/"
+
+            if path.startswith("/status"):
+                body = self._get_telemetry_json()
+                resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + body
+                conn.sendall(resp.encode())
+
+            elif path.startswith("/cmd"):
+                if "mode=AUTO" in path:
+                    self.mode = "AUTO"
+                    self.manual_cmd = "S"
+                    self.imu.reset_yaw()
+                    self.target_yaw = 0.0
+                    self.stall_start_ms = None
+                    self.state_text = "Tự hành (AUTO)"
+                elif "mode=MANUAL" in path:
+                    self.mode = "MANUAL"
+                    self.motors.stop()
+                    self.state_text = "Thủ công (MANUAL)"
+
+                if "dir=" in path:
+                    cmd_val = path.split("dir=")[1].split("&")[0]
+                    self.manual_cmd = cmd_val
+
+                if "spd=" in path:
+                    try:
+                        spd_val = int(path.split("spd=")[1].split("&")[0])
+                        self.user_speed = max(80, min(255, spd_val))
+                    except Exception:
+                        pass
+
+                if "reset_map=1" in path:
+                    self.pos_x = 0.0
+                    self.pos_y = 0.0
+                    self.imu.global_yaw = 0.0
+
+                body = self._get_telemetry_json()
+                resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + body
+                conn.sendall(resp.encode())
+
+            else:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n")
+                conn.sendall(WEB_HTML.encode())
+
+            conn.close()
+        except OSError:
+            pass
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _sleep_with_tasks(self, duration_ms):
+        """Thay thế sleep thông thường để vừa chờ vừa cập nhật MPU6050, Odometry và Web."""
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < duration_ms:
+            self.imu.update()
+            self.update_odometry()
+            self.poll_web_client()
+            time.sleep_ms(12)
+
+    def backup_straight(self, duration_ms):
+        """Đi lùi sâu và giữ thẳng hướng."""
+        self.imu.reset_yaw()
+        start_ms = time.ticks_ms()
+
+        while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:
+            if self.mode != "AUTO":
+                return
+            corr = 0.0
+            if self.imu.available:
+                yaw = self.imu.update()
+                corr = max(-25.0, min(25.0, yaw * Config.KP_HEADING))
+
+            left_spd = -Config.SPEED_BACKUP - corr
+            right_spd = -Config.SPEED_BACKUP + corr
+            self.motors.move_smooth(left_spd, right_spd, max_step=18.0)
+            self.update_odometry()
+            self.poll_web_client()
+            time.sleep_ms(18)
+
+        self.motors.brake()
+        self._sleep_with_tasks(80)
+
+    def turn_fast_90(self, direction_sign, wide_arc=True, custom_angle=None):
+        """Quay nhanh góc 90 độ (hoặc góc tùy chỉnh khi thoát kẹt) với tốc độ 200."""
+        target_angle = custom_angle if custom_angle is not None else Config.TURN_ANGLE_90
+
+        if not self.imu.available:
+            duration_ms = 420 if not wide_arc else 580
+            outer = Config.SPEED_TURN_FAST
+            inner = Config.SPEED_TURN_INNER if wide_arc else -Config.SPEED_TURN_FAST
+            if direction_sign > 0:
+                self.motors.set_motors(inner, outer)
+            else:
+                self.motors.set_motors(outer, inner)
+            self._sleep_with_tasks(duration_ms)
+            self.motors.brake()
+            return
+
+        self.imu.reset_yaw()
+        start_ms = time.ticks_ms()
+        timeout_ms = 1700
+
+        while time.ticks_diff(time.ticks_ms(), start_ms) < timeout_ms:
+            if self.mode != "AUTO":
+                return
+            current_yaw = self.imu.update()
+            self.update_odometry()
+            self.poll_web_client()
+
+            rem_angle = target_angle - abs(current_yaw)
+            if rem_angle <= 2.0:
+                break
+
+            if rem_angle > 22.0:
+                outer_speed = Config.SPEED_TURN_FAST
+            else:
+                outer_speed = max(
+                    Config.SPEED_TURN_MIN,
+                    min(Config.SPEED_TURN_FAST, rem_angle * Config.KP_TURN + Config.SPEED_TURN_MIN)
+                )
+
+            inner_speed = Config.SPEED_TURN_INNER if wide_arc else -outer_speed
+
+            if direction_sign > 0:
+                self.motors.set_motors(inner_speed, outer_speed)
+            else:
+                self.motors.set_motors(outer_speed, inner_speed)
+
+            time.sleep_ms(8)
+
+        self.motors.brake()
+        self._sleep_with_tasks(75)
+        self.imu.reset_yaw()
+        self.target_yaw = 0.0
+
+    def scan_left_right(self):
+        scan_angles = [170, 130, 50, 10]
+        distances = {}
+        for ang in scan_angles:
+            self.servo.set_angle(ang, settle_ms=130)
+            self.poll_web_client()
+            distances[ang] = self.sonar.get_distance(samples=3)
+        self.servo.center()
+        return distances
+
+    def find_clear_path_90(self, is_stuck_recovery=False):
+        """
+        Xử lý né vật cản hoặc thoát kẹt khi MPU6050 phát hiện xe đứng yên:
+        - Nếu `is_stuck_recovery = True`: Xe bị kẹt bởi vật cản khuất tầm siêu âm ->
+          Lùi sâu hơn và bắt buộc xoay sang hướng MỚI khác hướng ban đầu.
+        """
+        self.motors.brake()
+        self._sleep_with_tasks(70)
+
+        backup_ms = Config.BACKUP_TIME_STUCK if is_stuck_recovery else Config.BACKUP_TIME_NORMAL
+        if is_stuck_recovery:
+            self.state_text = "MPU6050: Phát hiện kẹt! Đang lùi thoát..."
+            print("[MPU6050 CHỐNG KẸT] Siêu âm thoáng nhưng xe không di chuyển -> Lùi sâu đổi hướng!")
+        else:
+            self.state_text = "Né vật cản: Đang lùi sâu..."
+            print(f"[NÉ VẬT CẢN] Phát hiện vật cản -> Lùi sâu ({backup_ms}ms)...")
+
+        self.backup_straight(backup_ms)
+        if self.mode != "AUTO":
+            return
+
+        radar = self.scan_left_right()
+        left_clear = max(radar[170], radar[130])
+        right_clear = max(radar[10], radar[50])
+
+        # Nếu là thoát kẹt mù và cả 2 bên đều tương đối thoáng, đảo chiều ưu tiên
+        # để tránh việc xe cứ lao lại vào đúng góc kẹt cũ
+        if is_stuck_recovery and min(left_clear, right_clear) > Config.DIST_CLEAR_PATH:
+            preferred_dir = -self.last_escape_dir
+        else:
+            preferred_dir = 1 if left_clear >= right_clear else -1
+
+        self.last_escape_dir = preferred_dir
+        dir_name = "TRÁI" if preferred_dir > 0 else "PHẢI"
+
+        if max(left_clear, right_clear) < Config.DIST_STOP + 2.0:
+            self.state_text = "Đường cụt: Quay 180°..."
+            self.backup_straight(Config.BACKUP_TIME_DEADEND)
+            self.turn_fast_90(preferred_dir, wide_arc=False)
+            self.turn_fast_90(preferred_dir, wide_arc=False)
+            return
+
+        # Khi thoát kẹt mù, xoay tại chỗ (wide_arc=False) một góc 105° để lệch hẳn khỏi hướng cũ
+        turn_deg = 105.0 if is_stuck_recovery else Config.TURN_ANGLE_90
+        use_wide = False if is_stuck_recovery else True
+
+        self.state_text = f"Quay nhanh sang {dir_name}..."
+        print(f"[CHUYỂN HƯỚNG] Quay nhanh {turn_deg:.0f}° sang {dir_name}...")
+        self.turn_fast_90(preferred_dir, wide_arc=use_wide, custom_angle=turn_deg)
+
+        for attempt in range(3):
+            if self.mode != "AUTO":
+                return
+            front_check = self.sonar.get_distance(samples=3)
+            self.last_dist = front_check
+            if front_check >= Config.DIST_CLEAR_PATH:
+                self.state_text = "Đường thoáng -> Chạy tiếp"
+                break
+            self.turn_fast_90(preferred_dir, wide_arc=False)
+
+        self.stall_start_ms = None
+
+    def check_mpu_stuck(self, commanded_speed):
+        """
+        Kiểm tra bằng MPU6050:
+        Nếu xe đang được cấp lệnh chạy tiến (`commanded_speed > 85`), cảm biến siêu âm
+        không thấy vật cản, nhưng năng lượng dao động MPU6050 quá thấp liên tục
+        vượt quá `STALL_TIMEOUT_MS` -> Kết luận xe bị kẹt.
+        """
+        if not self.imu.available or commanded_speed < 85.0:
+            self.stall_start_ms = None
+            return False
+
+        if self.imu.motion_energy < Config.STALL_MOTION_THRESHOLD:
+            if self.stall_start_ms is None:
+                self.stall_start_ms = time.ticks_ms()
+            elif time.ticks_diff(time.ticks_ms(), self.stall_start_ms) >= Config.STALL_TIMEOUT_MS:
+                self.stall_start_ms = None
+                return True
+        else:
+            self.stall_start_ms = None
+
+        return False
+
+    def compute_cruise_speed(self, distance):
+        """Tính vận tốc chạy tự động dựa trên mức tốc độ người dùng chọn trên Web."""
+        max_spd = float(self.user_speed)
+        min_spd = min(max_spd, float(Config.SPEED_MIN))
+        if distance >= Config.DIST_CRUISE:
+            return max_spd
+        if distance <= Config.DIST_STOP:
+            return 0.0
+        ratio = (distance - Config.DIST_STOP) / (Config.DIST_CRUISE - Config.DIST_STOP)
+        return min_spd + ratio * (max_spd - min_spd)
+
+    def handle_manual_mode(self):
+        """Điều khiển xe thủ công từ các nút bấm trên điện thoại."""
+        spd = float(self.user_speed)
+        turn_spd = max(110.0, spd * 0.85)
+
+        if self.manual_cmd == "F":
+            self.state_text = f"Thủ công: Tiến (Tốc độ {int(spd)})"
+            self.motors.move_smooth(spd, spd, max_step=25.0)
+        elif self.manual_cmd == "B":
+            self.state_text = f"Thủ công: Lùi (Tốc độ {int(spd)})"
+            self.motors.move_smooth(-spd, -spd, max_step=25.0)
+        elif self.manual_cmd == "L":
+            self.state_text = "Thủ công: Rẽ Trái"
+            self.motors.set_motors(-turn_spd * 0.6, turn_spd)
+        elif self.manual_cmd == "R":
+            self.state_text = "Thủ công: Rẽ Phải"
+            self.motors.set_motors(turn_spd, -turn_spd * 0.6)
+        else:
+            self.state_text = "Thủ công: Đang dừng chờ lệnh"
+            self.motors.stop()
+
+    def run(self):
+        self.servo.center()
+        self.imu.reset_yaw()
+        self.target_yaw = 0.0
+        loop_count = 0
+
+        try:
+            while True:
+                # 1. Cập nhật cảm biến góc MPU6050, tọa độ quỹ đạo & Web Server
+                current_yaw = self.imu.update()
+                self.update_odometry()
+                self.poll_web_client()
+
+                # 2. Đọc khoảng cách siêu âm
+                dist = self.sonar.get_distance(samples=2)
+                self.last_dist = dist
+
+                # 3. Nếu đang ở chế độ THỦ CÔNG trên điện thoại
+                if self.mode == "MANUAL":
+                    self.handle_manual_mode()
+                    time.sleep_ms(20)
+                    continue
+
+                # 4. Chế độ TỰ HÀNH (AUTO):
+                # 4a. Phát hiện vật cản bằng siêu âm (<= 26cm)
+                if dist <= Config.DIST_STOP:
+                    self.find_clear_path_90(is_stuck_recovery=False)
+                    continue
+
+                # 4b. Tính vận tốc chạy theo mức cài đặt (100 / 150 / 200...)
+                base_speed = self.compute_cruise_speed(dist)
+
+                # 4c. Phát hiện kẹt mù bằng MPU6050 (Siêu âm thoáng nhưng xe đứng yên)
+                if self.check_mpu_stuck(base_speed):
+                    self.find_clear_path_90(is_stuck_recovery=True)
+                    continue
+
+                # 4d. Bù lệch hướng PID từ MPU6050 để giữ xe đi thẳng
+                steering_correction = 0.0
+                if self.imu.available:
+                    yaw_error = self.target_yaw - current_yaw
+                    steering_correction = (
+                        Config.KP_HEADING * yaw_error - Config.KD_HEADING * self.imu.gz_deg_s
+                    )
+                    steering_correction = max(-35.0, min(35.0, steering_correction))
+
+                left_target = base_speed - steering_correction
+                right_target = base_speed + steering_correction
+                self.state_text = f"Tự hành: Đang chạy ({int(base_speed)}/255)"
+                self.motors.move_smooth(left_target, right_target, max_step=15.0)
+
+                loop_count += 1
+                if loop_count % 150 == 0:
+                    gc.collect()
+
+                time.sleep_ms(18)
+
+        except KeyboardInterrupt:
+            print("\n[DỪNG] Người dùng ngắt chương trình.")
+        finally:
+            self.motors.stop()
+            self.servo.center()
+            if self.server_sock:
+                self.server_sock.close()
+            print("[AN TOÀN] Đã tắt động cơ, đưa Servo về giữa và đóng kết nối mạng.")
+
+
+# ==============================================================================
+# KHỞI CHẠY CHƯƠNG TRÌNH
+# ==============================================================================
+if __name__ == "__main__":
+    car = AutonomousCar()
+    car.run()
